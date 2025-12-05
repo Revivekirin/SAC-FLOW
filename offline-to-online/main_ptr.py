@@ -12,7 +12,7 @@ from envs.ogbench_utils import make_ogbench_env_and_datasets
 from envs.robomimic_utils import is_robomimic_env
 
 from utils.flax_utils import save_agent
-from utils.datasets import Dataset, ReplayBuffer
+from utils.datasets import Dataset, ReplayBuffer, TrajectoryReplayBuffer
 
 from evaluation import evaluate
 from agents import agents
@@ -117,6 +117,37 @@ def main(_):
     discount = FLAGS.discount
     config["horizon_length"] = FLAGS.horizon_length
 
+    ## config for PTR
+    USE_PTR = True  # PTR 사용 여부
+    PTR_PRIORITY_METRIC = "uqm_reward"  # "uqm_reward", "avg_reward", "min_reward"
+    PTR_BETA_WEIGHT = 0.5  # Weighted target 계수 (robomimic: 0.5 추천)
+    
+    # Dataset 처리
+    train_dataset = process_train_dataset(train_dataset)
+    
+    if USE_PTR:
+        
+        # Offline dataset을 trajectory로 로드
+        trajectory_buffer = TrajectoryReplayBuffer(
+            buffer_size=FLAGS.buffer_size,
+            observation_space=env.observation_space,
+            action_space=env.action_space,
+            alpha=0.6,  # priority exponent
+            beta=0.4,   # IS exponent
+            priority_metric=PTR_PRIORITY_METRIC,
+        )
+        
+        # Offline dataset 로드
+        trajectory_buffer.load_offline_dataset({
+            'observations': np.array(train_dataset['observations']),
+            'actions': np.array(train_dataset['actions']),
+            'rewards': np.array(train_dataset['rewards']),
+            'next_observations': np.array(train_dataset['next_observations']),
+            'dones': np.array(train_dataset['terminals']),
+        })
+        
+        print(f"Loaded {len(trajectory_buffer.trajectories)} trajectories into PTR buffer")
+
     # handle dataset
     def process_train_dataset(ds):
         """
@@ -173,25 +204,50 @@ def main(_):
     )
 
     offline_init_time = time.time()
-    # Offline RL
+    # ===== Offline Training with PTR =====
     for i in tqdm.tqdm(range(1, FLAGS.offline_steps + 1)):
         log_step += 1
-
-        if FLAGS.ogbench_dataset_dir is not None and FLAGS.dataset_replace_interval != 0 and i % FLAGS.dataset_replace_interval == 0:
-            dataset_idx = (dataset_idx + 1) % len(dataset_paths)
-            print(f"Using new dataset: {dataset_paths[dataset_idx]}", flush=True)
-            train_dataset, val_dataset = make_ogbench_env_and_datasets(
-                FLAGS.env_name,
-                dataset_path=dataset_paths[dataset_idx],
-                compact_dataset=False,
-                dataset_only=True,
-                cur_env=env,
+        
+        if USE_PTR:
+            # PTR backward sampling
+            batch_samples, traj_indices = trajectory_buffer.sample_batch_backward(
+                batch_size=config['batch_size'],
+                discount=discount,
             )
-            train_dataset = process_train_dataset(train_dataset)
-
-        batch = train_dataset.sample_sequence(config['batch_size'], sequence_length=FLAGS.horizon_length, discount=discount)
-
+            
+            # ReplayBufferSamples를 agent 형식으로 변환
+            batch = {
+                'observations': batch_samples.observations.numpy(),
+                'actions': batch_samples.actions.numpy(),
+                'rewards': batch_samples.rewards.numpy(),
+                'next_observations': batch_samples.next_observations.numpy(),
+                'masks': 1.0 - batch_samples.dones.numpy(),
+                'terminals': batch_samples.dones.numpy(),
+                'valid': np.ones_like(batch_samples.rewards.numpy()),
+            }
+            
+            # Sequence 형태로 reshape (horizon_length=1로 처리)
+            for key in batch:
+                if key in ['observations', 'actions', 'next_observations']:
+                    batch[key] = batch[key][:, None, ...]  # [B, 1, ...]
+                else:
+                    batch[key] = batch[key][:, None]  # [B, 1]
+        else:
+            # 기존 sampling
+            batch = train_dataset.sample_sequence(
+                config['batch_size'], 
+                sequence_length=FLAGS.horizon_length, 
+                discount=discount
+            )
+        
+        # Agent update with weighted target
+        if USE_PTR and hasattr(agent, 'critic_loss_with_weighted_target'):
+            # Weighted target 사용
+            # Agent 내부에서 beta_weight 사용하도록 config 전달
+            agent.config.update({'beta_weight': PTR_BETA_WEIGHT})
+        
         agent, offline_info = agent.update(batch)
+
 
         if i % FLAGS.log_interval == 0:
             logger.log(offline_info, "offline_agent", step=log_step)
@@ -230,14 +286,26 @@ def main(_):
     from collections import defaultdict
     data = defaultdict(list)
     online_init_time = time.time()
+
+    # ===== Online Training with PTR =====
+    if USE_PTR:
+        # Online phase: 기존 ReplayBuffer 대신 TrajectoryReplayBuffer 사용
+        replay_buffer = trajectory_buffer
+    else:
+        replay_buffer = ReplayBuffer.create_from_initial_dataset(
+            dict(train_dataset), size=max(FLAGS.buffer_size, train_dataset.size + 1)
+        )
+    
+    ob, _ = env.reset()
+    action_queue = []
+    
     for i in tqdm.tqdm(range(1, FLAGS.online_steps + 1)):
         log_step += 1
         online_rng, key = jax.random.split(online_rng)
         
-        # during online rl, the action chunk is executed fully
+        # Action 실행
         if len(action_queue) == 0:
             action = agent.sample_actions(observations=ob, rng=key)
-
             action_chunk = np.array(action).reshape(-1, action_dim)
             for action in action_chunk:
                 action_queue.append(action)
@@ -245,60 +313,68 @@ def main(_):
         
         next_ob, int_reward, terminated, truncated, info = env.step(action)
         done = terminated or truncated
-
-        if FLAGS.save_all_online_states:
-            state = env.get_state()
-            data["steps"].append(i)
-            data["obs"].append(np.copy(next_ob))
-            data["qpos"].append(np.copy(state["qpos"]))
-            data["qvel"].append(np.copy(state["qvel"]))
-            if "button_states" in state:
-                data["button_states"].append(np.copy(state["button_states"]))
         
-        # logging useful metrics from info dict
-        env_info = {}
-        for key, value in info.items():
-            if key.startswith("distance"):
-                env_info[key] = value
-        # always log this at every step
-        logger.log(env_info, "env", step=log_step)
-
-        if 'antmaze' in FLAGS.env_name and (
-            'diverse' in FLAGS.env_name or 'play' in FLAGS.env_name or 'umaze' in FLAGS.env_name
-        ):
-            # Adjust reward for D4RL antmaze.
+        # Reward 조정
+        if is_robomimic_env(FLAGS.env_name):
             int_reward = int_reward - 1.0
-        elif is_robomimic_env(FLAGS.env_name):
-            # Adjust online (0, 1) reward for robomimic
-            int_reward = int_reward - 1.0
-
         if FLAGS.sparse:
-            assert int_reward <= 0.0
             int_reward = (int_reward != 0.0) * -1.0
-
-        transition = dict(
-            observations=ob,
-            actions=action,
-            rewards=int_reward,
-            terminals=float(done),
-            masks=1.0 - terminated,
-            next_observations=next_ob,
-        )
-        replay_buffer.add_transition(transition)
         
-        # done
+        # PTR에 transition 추가
+        if USE_PTR:
+            replay_buffer.add_transition_to_trajectory(
+                obs=ob.reshape(1, -1),
+                next_obs=next_ob.reshape(1, -1),
+                action=action.reshape(1, -1),
+                reward=np.array([[int_reward]]),
+                done=np.array([[done]]),
+                infos=[info]
+            )
+        else:
+            # 기존 방식
+            transition = dict(
+                observations=ob,
+                actions=action,
+                rewards=int_reward,
+                terminals=float(done),
+                masks=1.0 - terminated,
+                next_observations=next_ob,
+            )
+            replay_buffer.add_transition(transition)
+        
+        # Episode 종료 처리
         if done:
             ob, _ = env.reset()
-            action_queue = []  # reset the action queue
+            action_queue = []
         else:
             ob = next_ob
-
+        
+        # Training
         if i >= FLAGS.start_training:
-            batch = replay_buffer.sample_sequence(config['batch_size'] * FLAGS.utd_ratio, 
-                        sequence_length=FLAGS.horizon_length, discount=discount)
-            batch = jax.tree.map(lambda x: x.reshape((
-                FLAGS.utd_ratio, config["batch_size"]) + x.shape[1:]), batch)
-
+            if USE_PTR:
+                # PTR backward sampling
+                all_samples = []
+                all_traj_indices = []
+                for _ in range(FLAGS.utd_ratio):
+                    samples, traj_idx = replay_buffer.sample_batch_backward(
+                        batch_size=config['batch_size'],
+                        discount=discount,
+                    )
+                    all_samples.append(samples)
+                    all_traj_indices.append(traj_idx)
+                
+                # Batch 구성 (기존 형식 유지)
+                batch = self._construct_batch_from_samples(all_samples)
+            else:
+                # 기존 방식
+                batch = replay_buffer.sample_sequence(
+                    config['batch_size'] * FLAGS.utd_ratio,
+                    sequence_length=FLAGS.horizon_length,
+                    discount=discount
+                )
+                batch = jax.tree.map(lambda x: x.reshape((
+                    FLAGS.utd_ratio, config["batch_size"]) + x.shape[1:]), batch)
+            
             agent, update_info["online_agent"] = agent.batch_update(batch)
             
         if i % FLAGS.log_interval == 0:

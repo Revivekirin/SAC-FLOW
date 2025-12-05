@@ -263,4 +263,346 @@ def add_history(dataset, history_length):
     
     return dataset
 
+import jax
+import jax.numpy as jnp
+import numpy as np
+from typing import Dict, List, Tuple, Optional
+from flax.core.frozen_dict import FrozenDict
 
+
+class TrajectoryReplayBuffer:
+    """
+    PTR을 위한 Trajectory 단위 저장 및 샘플링 버퍼 (JAX 버전)
+    Dataset 클래스의 구조를 따르되, trajectory 단위 관리 추가
+    """
+    
+    def __init__(
+        self,
+        buffer_size: int,
+        alpha: float = 0.6,
+        beta: float = 0.4,
+        eps: float = 1e-6,
+        priority_metric: str = "uqm_reward",  # "uqm_reward", "avg_reward", "min_reward", "return"
+        num_trajectories_to_sample: int = 256,
+    ):
+        """
+        Args:
+            buffer_size: 최대 trajectory 개수
+            alpha: priority exponent
+            beta: importance sampling exponent
+            eps: numerical stability constant
+            priority_metric: trajectory quality 계산 방식
+            num_trajectories_to_sample: |B| in PTR paper
+        """
+        self.buffer_size = buffer_size
+        self.alpha = alpha
+        self.beta = beta
+        self.eps = eps
+        self.priority_metric = priority_metric
+        self.num_trajectories_to_sample = num_trajectories_to_sample
+        
+        # Trajectory 저장소
+        self.trajectories: List[Dict[str, np.ndarray]] = []
+        self.trajectory_priorities: List[float] = []
+        
+        # 현재 수집 중인 trajectory
+        self.current_trajectory: Dict[str, List] = {
+            'observations': [],
+            'actions': [],
+            'rewards': [],
+            'next_observations': [],
+            'terminals': [],
+            'masks': [],
+        }
+        
+        # PTR sampling 상태 관리 (Figure 2)
+        self.available_traj_indices: List[int] = []
+        self.sampled_traj_indices: List[int] = []
+        self.traj_sample_positions: Dict[int, int] = {}  # {traj_idx: current_backward_position}
+        
+    def add_transition(
+        self,
+        obs: np.ndarray,
+        action: np.ndarray,
+        reward: float,
+        next_obs: np.ndarray,
+        terminal: bool,
+        mask: float = 1.0,
+    ) -> None:
+        """현재 trajectory에 transition 추가"""
+        self.current_trajectory['observations'].append(obs)
+        self.current_trajectory['actions'].append(action)
+        self.current_trajectory['rewards'].append(reward)
+        self.current_trajectory['next_observations'].append(next_obs)
+        self.current_trajectory['terminals'].append(terminal)
+        self.current_trajectory['masks'].append(mask)
+        
+        # Episode 종료 시 trajectory 저장
+        if terminal:
+            self._finalize_trajectory()
+    
+    def _finalize_trajectory(self) -> None:
+        """현재 trajectory를 버퍼에 저장하고 priority 계산"""
+        if len(self.current_trajectory['observations']) == 0:
+            return
+        
+        # Numpy array로 변환
+        traj = {
+            k: np.array(v) for k, v in self.current_trajectory.items()
+        }
+        
+        # Priority 계산
+        priority = self._compute_trajectory_priority(traj)
+        
+        # 버퍼 저장
+        self.trajectories.append(traj)
+        self.trajectory_priorities.append(priority)
+        self.available_traj_indices.append(len(self.trajectories) - 1)
+        
+        # 버퍼 크기 초과 시 오래된 trajectory 제거
+        if len(self.trajectories) > self.buffer_size:
+            self._remove_oldest_trajectory()
+        
+        # 현재 trajectory 초기화
+        self.current_trajectory = {
+            'observations': [],
+            'actions': [],
+            'rewards': [],
+            'next_observations': [],
+            'terminals': [],
+            'masks': [],
+        }
+    
+    def _remove_oldest_trajectory(self) -> None:
+        """가장 오래된 trajectory 제거 및 인덱스 업데이트"""
+        removed_idx = 0
+        self.trajectories.pop(removed_idx)
+        self.trajectory_priorities.pop(removed_idx)
+        
+        # 모든 인덱스를 1씩 감소
+        self.available_traj_indices = [
+            idx - 1 for idx in self.available_traj_indices if idx > 0
+        ]
+        self.sampled_traj_indices = [
+            idx - 1 for idx in self.sampled_traj_indices if idx > 0
+        ]
+        
+        # traj_sample_positions 업데이트
+        new_positions = {}
+        for idx, pos in self.traj_sample_positions.items():
+            if idx > 0:
+                new_positions[idx - 1] = pos
+        self.traj_sample_positions = new_positions
+    
+    def _compute_trajectory_priority(self, trajectory: Dict[str, np.ndarray]) -> float:
+        """
+        PTR Section 5.1: Trajectory quality 기반 priority 계산
+        Robomimic sparse reward에 최적화
+        """
+        rewards = trajectory['rewards'].flatten()
+        
+        if self.priority_metric == "uqm_reward":
+            # Upper Quartile Mean - 상위 25%의 평균
+            if len(rewards) > 0:
+                percentile_75 = np.percentile(rewards, 75)
+                uqm_rewards = rewards[rewards >= percentile_75]
+                return float(np.mean(uqm_rewards)) if len(uqm_rewards) > 0 else self.eps
+            return self.eps
+            
+        elif self.priority_metric == "avg_reward":
+            # 전체 평균
+            return float(np.mean(rewards)) if len(rewards) > 0 else self.eps
+            
+        elif self.priority_metric == "min_reward":
+            # 최소값 (conservative)
+            return float(np.min(rewards)) if len(rewards) > 0 else self.eps
+            
+        elif self.priority_metric == "return":
+            # Undiscounted return
+            return float(np.sum(rewards))
+            
+        else:
+            return 1.0
+    
+    def sample(self, batch_size: int) -> Dict[str, np.ndarray]:
+        """
+        PTR의 핵심: Prioritized trajectory sampling + Backward sampling
+        
+        Returns:
+            batch: 샘플링된 transitions의 딕셔너리
+        """
+        batch_transitions = []
+        batch_traj_indices = []
+        
+        for _ in range(batch_size):
+            # Step 1: 새로운 trajectory가 필요한 경우 prioritized sampling
+            if len(self.sampled_traj_indices) < self.num_trajectories_to_sample:
+                self._sample_new_trajectories()
+            
+            # Step 2: Sampled trajectories에서 backward sampling
+            if len(self.sampled_traj_indices) == 0:
+                # Fallback: random trajectory
+                if len(self.trajectories) == 0:
+                    raise ValueError("No trajectories available for sampling")
+                traj_idx = np.random.choice(len(self.trajectories))
+            else:
+                traj_idx = self.sampled_traj_indices[0]
+            
+            # 현재 trajectory에서 backward position 가져오기
+            if traj_idx not in self.traj_sample_positions:
+                # 새로 샘플링된 trajectory: 끝에서 시작
+                traj_len = len(self.trajectories[traj_idx]['observations'])
+                self.traj_sample_positions[traj_idx] = traj_len - 1
+            
+            pos = self.traj_sample_positions[traj_idx]
+            traj = self.trajectories[traj_idx]
+            
+            # Transition 추출
+            transition = {
+                'observations': traj['observations'][pos],
+                'actions': traj['actions'][pos],
+                'rewards': traj['rewards'][pos],
+                'next_observations': traj['next_observations'][pos],
+                'terminals': traj['terminals'][pos],
+                'masks': traj['masks'][pos],
+            }
+            batch_transitions.append(transition)
+            batch_traj_indices.append(traj_idx)
+            
+            # Backward position 업데이트
+            self.traj_sample_positions[traj_idx] -= 1
+            
+            # Trajectory 끝에 도달하면 제거
+            if self.traj_sample_positions[traj_idx] < 0:
+                self.sampled_traj_indices.remove(traj_idx)
+                del self.traj_sample_positions[traj_idx]
+                # Available로 다시 추가
+                if traj_idx not in self.available_traj_indices:
+                    self.available_traj_indices.append(traj_idx)
+        
+        # 배치로 변환
+        batch = self._transitions_to_batch(batch_transitions)
+        batch['trajectory_indices'] = np.array(batch_traj_indices)
+        
+        return batch
+    
+    def _sample_new_trajectories(self) -> None:
+        """
+        PTR Section 5: Priority 기반 trajectory sampling
+        """
+        if len(self.available_traj_indices) == 0:
+            return
+        
+        # Priority 계산
+        available_priorities = np.array([
+            self.trajectory_priorities[idx] for idx in self.available_traj_indices
+        ])
+        
+        # Rank-based probability (PTR Eq. 5)
+        ranks = np.argsort(np.argsort(-available_priorities)) + 1  # 높은 priority = 낮은 rank
+        p_rank = 1.0 / ranks
+        p_rank = p_rank ** self.alpha
+        p_rank = p_rank / p_rank.sum()
+        
+        # Sample trajectories
+        num_to_sample = min(
+            self.num_trajectories_to_sample - len(self.sampled_traj_indices),
+            len(self.available_traj_indices)
+        )
+        
+        sampled_indices = np.random.choice(
+            len(self.available_traj_indices),
+            size=num_to_sample,
+            replace=False,
+            p=p_rank
+        )
+        
+        for idx in sampled_indices:
+            traj_idx = self.available_traj_indices[idx]
+            self.sampled_traj_indices.append(traj_idx)
+        
+        # Available에서 제거
+        for idx in sorted(sampled_indices, reverse=True):
+            self.available_traj_indices.pop(idx)
+    
+    def _transitions_to_batch(self, transitions: List[Dict]) -> Dict[str, np.ndarray]:
+        """Transition list를 batch 딕셔너리로 변환"""
+        batch = {}
+        keys = transitions[0].keys()
+        
+        for key in keys:
+            batch[key] = np.stack([t[key] for t in transitions])
+        
+        return batch
+    
+    def load_from_dataset(self, dataset: Dict[str, np.ndarray]) -> None:
+        """
+        Offline dataset을 trajectory 단위로 로드
+        
+        Args:
+            dataset: 'observations', 'actions', 'rewards', 'terminals', 'masks' 포함
+        """
+        # Episode boundaries 찾기
+        terminals = dataset.get('terminals', None)
+        if terminals is None:
+            raise ValueError("Dataset must contain 'terminals'")
+        
+        episode_starts = [0]
+        for i in range(len(terminals)):
+            if terminals[i]:
+                episode_starts.append(i + 1)
+        
+        # 마지막 episode가 완료되지 않았으면 제외
+        if episode_starts[-1] >= len(terminals):
+            episode_starts = episode_starts[:-1]
+        
+        # 각 episode를 trajectory로 저장
+        for start_idx in range(len(episode_starts) - 1):
+            start = episode_starts[start_idx]
+            end = episode_starts[start_idx + 1]
+            
+            traj = {
+                'observations': dataset['observations'][start:end],
+                'actions': dataset['actions'][start:end],
+                'rewards': dataset['rewards'][start:end].reshape(-1),
+                'next_observations': dataset.get(
+                    'next_observations', 
+                    np.concatenate([dataset['observations'][start+1:end], 
+                                   dataset['observations'][end-1:end]], axis=0)
+                ),
+                'terminals': terminals[start:end],
+                'masks': dataset.get('masks', np.ones(end - start, dtype=np.float32)),
+            }
+            
+            priority = self._compute_trajectory_priority(traj)
+            self.trajectories.append(traj)
+            self.trajectory_priorities.append(priority)
+            self.available_traj_indices.append(len(self.trajectories) - 1)
+    
+    @property
+    def size(self) -> int:
+        """현재 저장된 trajectory 개수"""
+        return len(self.trajectories)
+    
+    def get_statistics(self) -> Dict[str, float]:
+        """버퍼 통계 정보"""
+        if len(self.trajectories) == 0:
+            return {
+                'num_trajectories': 0,
+                'avg_trajectory_length': 0.0,
+                'avg_priority': 0.0,
+                'max_priority': 0.0,
+                'min_priority': 0.0,
+            }
+        
+        traj_lengths = [len(t['observations']) for t in self.trajectories]
+        
+        return {
+            'num_trajectories': len(self.trajectories),
+            'avg_trajectory_length': np.mean(traj_lengths),
+            'avg_priority': np.mean(self.trajectory_priorities),
+            'max_priority': np.max(self.trajectory_priorities),
+            'min_priority': np.min(self.trajectory_priorities),
+            'num_available': len(self.available_traj_indices),
+            'num_sampled': len(self.sampled_traj_indices),
+        }
