@@ -122,11 +122,8 @@ def main(_):
     PTR_PRIORITY_METRIC = "uqm_reward"  # "uqm_reward", "avg_reward", "min_reward"
     PTR_BETA_WEIGHT = 0.5  # Weighted target 계수 (robomimic: 0.5 추천)
     
-    # Dataset 처리
-    train_dataset = process_train_dataset(train_dataset)
     
     if USE_PTR:
-        
         # Offline dataset을 trajectory로 로드
         trajectory_buffer = TrajectoryReplayBuffer(
             buffer_size=FLAGS.buffer_size,

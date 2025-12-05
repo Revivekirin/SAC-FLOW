@@ -50,7 +50,64 @@ class ACFQLAgent(flax.struct.PyTreeNode):
             'q_max': q.max(),
             'q_min': q.min(),
         }
-
+    
+    def critic_loss_with_weighted_target(self, batch, grad_params, rng, beta_weight=0.5):
+        """
+        PTR Section 4.2: Weighted backward update
+        혼합 target으로 extrapolation error 완화
+        """
+        if self.config["action_chunking"]:
+            batch_actions = jnp.reshape(batch["actions"], (batch["actions"].shape[0], -1))
+        else:
+            batch_actions = batch["actions"][..., 0, :]
+        
+        # Original TD target (Bellman)
+        rng, sample_rng = jax.random.split(rng)
+        next_actions = self.sample_actions(batch['next_observations'][..., -1, :], rng=sample_rng)
+        next_qs = self.network.select(f'target_critic')(
+            batch['next_observations'][..., -1, :], actions=next_actions
+        )
+        if self.config['q_agg'] == 'min':
+            next_q_bellman = next_qs.min(axis=0)
+        else:
+            next_q_bellman = next_qs.mean(axis=0)
+        
+        # SARSA target (in-trajectory action)
+        # batch에 next_actions가 있다고 가정 (trajectory 샘플링 시 제공)
+        if "next_actions" in batch:
+            next_actions_sarsa = batch["next_actions"][..., -1, :]
+            if self.config["action_chunking"]:
+                next_actions_sarsa = jnp.reshape(next_actions_sarsa, 
+                                                 (next_actions_sarsa.shape[0], -1))
+            
+            next_qs_sarsa = self.network.select(f'target_critic')(
+                batch['next_observations'][..., -1, :], actions=next_actions_sarsa
+            )
+            if self.config['q_agg'] == 'min':
+                next_q_sarsa = next_qs_sarsa.min(axis=0)
+            else:
+                next_q_sarsa = next_qs_sarsa.mean(axis=0)
+            
+            # Weighted target (PTR Eq. 4)
+            next_q = (1 - beta_weight) * next_q_sarsa + beta_weight * next_q_bellman
+        else:
+            next_q = next_q_bellman
+        
+        target_q = batch['rewards'][..., -1] + \
+            (self.config['discount'] ** self.config["horizon_length"]) * \
+            batch['masks'][..., -1] * next_q
+        
+        q = self.network.select('critic')(batch['observations'], 
+                                         actions=batch_actions, params=grad_params)
+        
+        critic_loss = (jnp.square(q - target_q) * batch['valid'][..., -1]).mean()
+        
+        return critic_loss, {
+            'critic_loss': critic_loss,
+            'q_mean': q.mean(),
+            'target_q_mean': target_q.mean(),
+        }
+    
     def actor_loss(self, batch, grad_params, rng):
         """Compute the FQL actor loss."""
         if self.config["action_chunking"]:
@@ -343,3 +400,5 @@ def get_config():
         )
     )
     return config
+
+

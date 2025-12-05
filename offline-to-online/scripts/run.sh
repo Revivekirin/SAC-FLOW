@@ -31,7 +31,7 @@ MUJOCO_GL=egl python main_action_reg_three_phase.py \
 
 #acfql
 
-MUJOCO_GL=egl  python main.py \
+MUJOCO_GL=egl  python main_ptr.py \
  --run_group=reproduce \
  --agent.alpha=100 \
  --env_name=square-mh-low_dim  \
