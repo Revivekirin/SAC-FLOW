@@ -193,7 +193,7 @@ rich==11.2.0
     #   tyro
 rsa==4.7.2
     # via google-auth
-sentry-sdk==1.22.2
+sentry-sdk
     # via wandb
 setproctitle==1.3.2
     # via wandb

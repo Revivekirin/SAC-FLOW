@@ -3,10 +3,10 @@ import os
 os.environ['CUDA_VISIBLE_DEVICES'] = '2'
 os.environ['XLA_PYTHON_CLIENT_PREALLOCATE'] = 'false'
 
+
 if 'CUDA_VISIBLE_DEVICES' in os.environ:
     os.environ['EGL_DEVICE_ID'] = os.environ['CUDA_VISIBLE_DEVICES']
     os.environ['MUJOCO_EGL_DEVICE_ID'] = os.environ['CUDA_VISIBLE_DEVICES']
-
 import random
 import time
 import tqdm
@@ -28,10 +28,11 @@ import tyro
 from flax.training.train_state import TrainState as FlaxTrainState
 from torch.utils.tensorboard import SummaryWriter
 from flax.linen.initializers import zeros, constant
-from cleanrl_utils.buffers import ReplayBuffer
+from cleanrl_utils.buffers import PrioritizedReplayBuffer
 
 from envs.env_utils import make_env_and_datasets
 from envs.robomimic_utils import is_robomimic_env
+
 
 @dataclass
 class Args:
@@ -526,12 +527,18 @@ if __name__ == "__main__":
     assert isinstance(envs.single_action_space, gym.spaces.Box), "only continuous action space is supported"
 
     envs.single_observation_space.dtype = np.float32
-    rb = ReplayBuffer(
-        args.buffer_size,
-        envs.single_observation_space,
-        envs.single_action_space,
+
+    rb = PrioritizedReplayBuffer(
+        buffer_size=args.buffer_size,
+        observation_space=envs.single_observation_space,
+        action_space=envs.single_action_space,
         device="cpu",
+        n_envs=1,
+        optimize_memory_usage=False,
         handle_timeout_termination=False,
+        alpha=0.6,
+        beta=0.4,
+        eps_uniform=0.2,
     )
 
     obs, _ = envs.reset(seed=args.seed)
@@ -730,6 +737,120 @@ if __name__ == "__main__":
         return qf_state, qf_loss_value, current_q_values.mean(), next_q_values.mean(), key
 
     @jax.jit
+    def update_critic_with_weights(
+        actor_state: TrainState,
+        qf_state: TrainState,
+        alpha_state: TrainState,
+        observations: np.ndarray,
+        actions: np.ndarray,
+        next_observations: np.ndarray,
+        rewards: np.ndarray,
+        terminations: np.ndarray,
+        weights: np.ndarray,          # [batch_size]
+        key: jnp.ndarray,
+    ):
+        """
+        CrossQ + SAC critic update with PER importance-sampling weights.
+
+        returns:
+            qf_state: updated critic state
+            qf_loss_value: scalar loss
+            current_q_mean: for logging
+            next_q_mean: for logging
+            td_errors: per-sample TD-error (np.abs(target - Q)^agg), shape [batch_size]
+            key: new PRNGKey
+        """
+        key, sample_key = jax.random.split(key, 2)
+
+        # JAX 배열로 변환
+        observations = jnp.asarray(observations)
+        actions = jnp.asarray(actions)
+        next_observations = jnp.asarray(next_observations)
+        rewards = jnp.asarray(rewards)
+        terminations = jnp.asarray(terminations)
+        # weights: [B] -> [B, 1]
+        weights_jnp = jnp.asarray(weights).reshape(-1, 1)
+
+        # 다음 상태에서 policy로 action 샘플
+        next_actions, next_log_prob = actor_apply_inference(
+            actor_state.params, actor_state.batch_stats,
+            next_observations, sample_key
+        )
+
+        if alpha_state is not None:
+            alpha_value = entropy_coef.apply({'params': alpha_state.params})
+        else:
+            alpha_value = args.alpha
+
+        def loss_fn(params, batch_stats):
+            # -----------------------------
+            # CrossQ or standard SAC forward
+            # -----------------------------
+            if not args.crossq_style:
+                # Standard: separate forward
+                next_q_values = qf_apply_inference(
+                    qf_state.target_params, qf_state.target_batch_stats,
+                    next_observations, next_actions
+                )
+                current_q_values, new_batch_stats_dict = qf_apply_train(
+                    params, batch_stats, observations, actions
+                )
+                new_batch_stats = new_batch_stats_dict.get('batch_stats', {})
+            else:
+                # CrossQ: joint forward
+                cat_observations = jnp.concatenate([observations, next_observations], axis=0)
+                cat_actions = jnp.concatenate([actions, next_actions], axis=0)
+
+                catted_q_values, new_batch_stats_dict = qf_apply_train(
+                    params, batch_stats, cat_observations, cat_actions
+                )
+                new_batch_stats = new_batch_stats_dict.get('batch_stats', {})
+
+                # catted_q_values: [n_critics, 2B, 1] 가정
+                current_q_values, next_q_values = jnp.split(catted_q_values, 2, axis=1)
+
+            # -----------------------------
+            # Target Q, TD-error 계산
+            # -----------------------------
+            # next_q_values: [n_critics, B, 1]
+            next_q_values_min = jnp.min(next_q_values, axis=0)     # [B, 1]
+            next_q_values_min = next_q_values_min - alpha_value * next_log_prob  # [B, 1]
+
+            target_q_values = rewards.reshape(-1, 1) + (1.0 - terminations.reshape(-1, 1)) * args.gamma * next_q_values_min
+
+            # current_q_values: [n_critics, B, 1]
+            # ensemble 평균 기준 TD-error 사용
+            td_errors_per_critic = jax.lax.stop_gradient(target_q_values) - current_q_values  # [n_critics, B, 1]
+            td_errors = jnp.mean(td_errors_per_critic, axis=0)  # [B, 1]
+
+            # -----------------------------
+            # PER: weighted MSE
+            # loss = E_i[ w_i * (δ_i^2) ]
+            # -----------------------------
+            weighted_squared = weights_jnp * (td_errors ** 2)  # [B, 1]
+            # normalization: sum(w δ^2) / sum(w)
+            loss = 0.5 * weighted_squared.sum() / (weights_jnp.sum() + 1e-8)
+
+            # 로그용 mean 값들
+            current_q_mean = current_q_values.mean()
+            next_q_mean = next_q_values_min.mean()
+
+            # td_errors는 나중에 priority 업데이트에 사용하므로 반환에 포함
+            return loss, (current_q_mean, next_q_mean, new_batch_stats, td_errors)
+
+        (qf_loss_value, (current_q_mean, next_q_mean, new_batch_stats, td_errors)), grads = \
+            jax.value_and_grad(loss_fn, has_aux=True)(qf_state.params, qf_state.batch_stats)
+
+        qf_state = qf_state.apply_gradients(grads=grads)
+        if args.use_batch_norm:
+            qf_state = qf_state.replace(batch_stats=new_batch_stats)
+
+        # td_errors: [B,1] -> [B]
+        td_errors = jnp.squeeze(td_errors, axis=-1)
+
+        return qf_state, qf_loss_value, current_q_mean, next_q_mean, td_errors, key
+
+    @jax.jit
     def update_actor_and_alpha(
         actor_state: TrainState,
         qf_state: TrainState,
@@ -795,7 +916,7 @@ if __name__ == "__main__":
     completed_episodes = 0
     all_episode_returns = []
     log_buffer = {}
-
+    
     for global_step in tqdm.tqdm(range(args.total_timesteps)):
         if global_step < args.learning_starts:
             actions = np.array([envs.single_action_space.sample() for _ in range(envs.num_envs)])
@@ -807,6 +928,7 @@ if __name__ == "__main__":
             actions = np.array(jax.device_get(actions))
 
         next_obs, rewards, terminations, truncations, infos = envs.step(actions)
+
 
         # === robomimic reward shaping (online) === ***
         if is_robomimic_env(args.env_id):
@@ -849,22 +971,72 @@ if __name__ == "__main__":
         obs = next_obs
 
         if global_step > args.learning_starts:
-            data = rb.sample(args.batch_size)
 
-            qf_state, qf_loss_value, qf_a_values, next_q_values, key = update_critic(
+            data, batch_inds, weights = rb.sample_with_priority(args.batch_size)
+
+            qf_state, qf_loss_value, qf_a_values, next_q_values, td_errors, key = update_critic_with_weights(
                 actor_state,
                 qf_state,
                 alpha_state,
-                data.observations.numpy(),
-                data.actions.numpy(),
-                data.next_observations.numpy(),
-                data.rewards.flatten().numpy(),
-                data.dones.flatten().numpy(),
+                data.observations,          
+                data.actions,
+                data.next_observations,
+                data.rewards.flatten(),
+                data.dones.flatten(),
+                weights,                    # [batch_size]
                 key,
             )
 
+            sampled_priorities = rb.priorities[batch_inds]  # cleanrl PrioritizedReplayBuffer 기준
+
+            # TD-error → NumPy 변환 후 priority 업데이트
+            td_errors_np = np.abs(np.asarray(jax.device_get(td_errors)))
+            abs_td_errors_np = np.abs(td_errors_np)
+            
+            rb.update_priorities(batch_inds, td_errors_np)
+
+            # ====== start Debugging ==========
+            # weights, td_errors, priorities 기본 통계
+            per_log = {
+                "per/weights_mean": float(weights.mean()),
+                "per/weights_std": float(weights.std()),
+                "per/weights_min": float(weights.min()),
+                "per/weights_max": float(weights.max()),
+
+                "per/td_error_mean": float(abs_td_errors_np.mean()),
+                "per/td_error_std": float(abs_td_errors_np.std()),
+                "per/td_error_min": float(abs_td_errors_np.min()),
+                "per/td_error_max": float(abs_td_errors_np.max()),
+
+                "per/sampled_priority_mean": float(sampled_priorities.mean()),
+                "per/sampled_priority_std": float(sampled_priorities.std()),
+                "per/sampled_priority_min": float(sampled_priorities.min()),
+                "per/sampled_priority_max": float(sampled_priorities.max()),
+
+                # 전체 버퍼 priority 분포 대략 보기
+                "per/buffer_priority_mean": float(rb.priorities.mean()),
+                "per/buffer_priority_max": float(rb.priorities.max()),
+            }
+
+            # TD-error vs weight 상관계수
+            if abs_td_errors_np.std() > 1e-8 and weights.std() > 1e-8:
+                corr = np.corrcoef(abs_td_errors_np.reshape(-1), weights.reshape(-1))[0, 1]
+            else:
+                corr = 0.0
+            per_log["per/corr_td_error_weight"] = float(corr)
+
+            # 전체 로그 dict에 합치기 위해 log_buffer에 저장
+            if args.track:
+                for k, v in per_log.items():
+                    log_buffer.setdefault(k, deque(maxlen=20)).append(v)
+            # ====== end Debugging ==========
+
+
+            # target network 업데이트는 그대로
             qf_state = update_target(qf_state, args.tau)
             n_updates += 1
+
+            data, batch_inds, weights = rb.sample_with_priority(args.batch_size)
 
             actor_loss_value = 0.0
             alpha_loss_value = 0.0
@@ -876,7 +1048,7 @@ if __name__ == "__main__":
                     data.observations.numpy(),
                     key,
                 )
-            
+
             if global_step % args.log_freq == 0:
                 sps = int(global_step / (time.time() - start_time))
                 log_data = {
@@ -896,23 +1068,21 @@ if __name__ == "__main__":
                 
                 log_data["losses/alpha"] = alpha_value
 
+                # ==== PER 로깅 추가: 최근 20 스텝 평균을 같이 wandb에 ====
+                if args.track:
+                    for k, v in log_buffer.items():
+                        if len(v) > 0:
+                            log_data[k] = float(np.mean(v))
+                # ============================================
+
                 for k, v in log_data.items():
                     writer.add_scalar(k, v, global_step)
                 
                 print(f"SPS: {sps}")
 
                 if args.track:
-                    for k, v in log_data.items():
-                        log_buffer.setdefault(k, deque(maxlen=20)).append(v)
-                    
-                    avg_logs = {k: np.mean(v) for k, v in log_buffer.items() if "charts/episodic" not in k}
-                    if "charts/episodic_return" in log_buffer:
-                        avg_logs["charts/episodic_return"] = np.mean(log_buffer["charts/episodic_return"])
-                    if "charts/episodic_length" in log_buffer:
-                         avg_logs["charts/episodic_length"] = np.mean(log_buffer["charts/episodic_length"])
-                    
-                    wandb.log(avg_logs, step=global_step)
-    
+                    wandb.log(log_data, step=global_step)
+
     envs.close()
     writer.close()
     if args.track:

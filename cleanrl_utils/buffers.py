@@ -608,3 +608,129 @@ class RolloutBuffer(BaseBuffer):
             self.returns[batch_inds].flatten(),
         )
         return RolloutBufferSamples(*tuple(map(self.to_torch, data)))
+
+
+class PrioritizedReplayBuffer(ReplayBuffer):
+    """
+    TD-error 기반 Prioritized ReplayBuffer.
+    - 부모 ReplayBuffer의 저장 구조/인터페이스는 그대로 사용
+    - priority만 따로 관리
+    - 샘플링 시 priority^(alpha) 기반 확률로 인덱스 뽑음
+    """
+
+    def __init__(
+        self,
+        buffer_size: int,
+        observation_space,
+        action_space,
+        device="auto",
+        n_envs: int = 1,
+        optimize_memory_usage: bool = False,
+        handle_timeout_termination: bool = True,
+        alpha: float = 0.6,
+        beta: float = 0.4,
+        eps: float = 1e-6,
+        eps_uniform: float = 0.2,
+    ):
+        super().__init__(
+            buffer_size=buffer_size,
+            observation_space=observation_space,
+            action_space=action_space,
+            device=device,
+            n_envs=n_envs,
+            optimize_memory_usage=optimize_memory_usage,
+            handle_timeout_termination=handle_timeout_termination,
+        )
+
+        # 단순화를 위해 우선 n_envs=1, optimize_memory_usage=False 기준
+        assert self.n_envs == 1, "간단 버전은 n_envs=1만 지원 (multi-env는 priority 설계 따로 필요)"
+        assert not self.optimize_memory_usage, "간단 버전은 optimize_memory_usage=False만 지원"
+
+        self.alpha = alpha      # priority exponent
+        self.beta = beta        # IS exponent
+        self.eps = eps
+        self.eps_uniform = eps_uniform  # uniform ratio
+
+        self.priorities = np.ones((self.buffer_size,), dtype=np.float32)
+
+
+    def add(
+        self,
+        obs: np.ndarray,
+        next_obs: np.ndarray,
+        action: np.ndarray,
+        reward: np.ndarray,
+        done: np.ndarray,
+        infos: list[dict],
+    ) -> None:
+        super().add(obs, next_obs, action, reward, done, infos)
+
+        idx = (self.pos - 1) % self.buffer_size
+
+        max_prio = float(self.priorities.max())
+        if max_prio <= 0:
+            max_prio = 1.0
+        self.priorities[idx] = max_prio
+
+
+    def _get_probabilities(self) -> np.ndarray:
+        """
+        현재 버퍼 내 유효 인덱스(0 ~ len-1)에 대한 sampling 확률 리턴
+        """
+        if self.full:
+            valid_size = self.buffer_size
+        else:
+            valid_size = self.pos
+
+        prios = self.priorities[:valid_size]  # [valid_size]
+        scaled = prios ** self.alpha          # priority^alpha
+
+        scaled_sum = scaled.sum()
+        if scaled_sum == 0.0:
+            return np.ones_like(scaled) / float(valid_size)
+
+        p_prio = scaled / scaled_sum
+        p_uniform = np.ones_like(p_prio) / float(valid_size)
+
+        # PTR-style: mixture of uniform & prioritized
+        p = (1.0 - self.eps_uniform) * p_prio + self.eps_uniform * p_uniform
+        return p
+
+
+    def sample_with_priority(
+        self, batch_size: int
+    ) -> tuple[ReplayBufferSamples, np.ndarray, np.ndarray]:
+        """
+        priority 기반 샘플링 + IS weight + 인덱스를 함께 반환.
+        - 기존 sample()은 그대로 남겨두고,
+        - 알고리즘 쪽에서 이 메서드를 직접 호출해서 사용하면 됨.
+        """
+        probs = self._get_probabilities()    
+        valid_size = len(probs)
+
+        batch_inds = np.random.choice(
+            valid_size,
+            size=batch_size,
+            p=probs,
+            replace=False if valid_size >= batch_size else True,
+        )
+
+        # importance-sampling weight
+        # w_i ∝ (1 / (N * p_i))^beta
+        weights = (valid_size * probs[batch_inds]) ** (-self.beta)
+        weights = weights / weights.max()   # normalize to [0, 1]
+        weights = weights.astype(np.float32)
+
+        samples = self._get_samples(batch_inds)  # ReplayBufferSamples
+
+        print("[DEBUG] probs debug:", probs[:10], "sum:", probs.sum())
+        print("[DEBUG] sampled debug:", batch_inds, "probs:", probs[batch_inds], "weights:", weights, "samples.rewards:", samples.rewards.flatten().cpu().numpy())
+
+        return samples, batch_inds, weights
+
+    def update_priorities(self, batch_inds: np.ndarray, td_errors: np.ndarray) -> None:
+        """
+        td_errors: shape [batch_size]
+        """
+        td_errors = np.abs(td_errors) + self.eps
+        self.priorities[batch_inds] = td_errors

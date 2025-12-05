@@ -58,6 +58,9 @@ flags.DEFINE_string('ogbench_dataset_dir', None, 'OGBench dataset directory')
 flags.DEFINE_integer('horizon_length', 5, 'action chunking length.')
 flags.DEFINE_bool('sparse', False, "make the task sparse reward")
 
+flags.DEFINE_string('entity', 'sophia435256-robros', 'wandb entity')
+flags.DEFINE_string('mode', 'online', 'wandb mode')
+
 flags.DEFINE_bool('save_all_online_states', False, "save all trajectories to npy")
 
 class LoggingHelper:
@@ -78,8 +81,8 @@ def main(_):
     base_exp_name = get_exp_name(FLAGS.seed)
     flow_step = FLAGS.agent['denoising_steps']
     exp_name = f"{agent_name}_{task_name}_{base_exp_name}_{flow_step}"
-    run = setup_wandb(project='qc', group=FLAGS.run_group, name=exp_name)
-    
+    run = setup_wandb(project='qc', group=FLAGS.run_group, name=exp_name, entity=FLAGS.entity, mode=FLAGS.mode)
+     
     FLAGS.save_dir = os.path.join(FLAGS.save_dir, wandb.run.project, FLAGS.run_group, FLAGS.env_name, exp_name)
     os.makedirs(FLAGS.save_dir, exist_ok=True)
     flag_dict = get_flag_dict()
