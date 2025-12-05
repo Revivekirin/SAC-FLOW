@@ -723,9 +723,6 @@ class PrioritizedReplayBuffer(ReplayBuffer):
 
         samples = self._get_samples(batch_inds)  # ReplayBufferSamples
 
-        print("[DEBUG] probs debug:", probs[:10], "sum:", probs.sum())
-        print("[DEBUG] sampled debug:", batch_inds, "probs:", probs[batch_inds], "weights:", weights, "samples.rewards:", samples.rewards.flatten().cpu().numpy())
-
         return samples, batch_inds, weights
 
     def update_priorities(self, batch_inds: np.ndarray, td_errors: np.ndarray) -> None:

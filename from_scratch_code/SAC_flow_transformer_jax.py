@@ -1,7 +1,7 @@
 # CrossQ implementation with Transformer-based Flow Actor - Modified Version
 import os
-os.environ['CUDA_VISIBLE_DEVICES'] = '2'
-os.environ['XLA_PYTHON_CLIENT_PREALLOCATE'] = 'false'
+# os.environ['CUDA_VISIBLE_DEVICES'] = '2'
+# os.environ['XLA_PYTHON_CLIENT_PREALLOCATE'] = 'false'
 
 if 'CUDA_VISIBLE_DEVICES' in os.environ:
     os.environ['EGL_DEVICE_ID'] = os.environ['CUDA_VISIBLE_DEVICES']
@@ -96,26 +96,43 @@ class Args:
 
     sparse: bool = False
 
+    eval_freq: int = 50000
+    """how often to run evaluation"""
+    eval_episodes: int = 50
+
     # wandb
     wandb_project_name: str = "sacflow-fromscratch-" + env_id
     """the wandb's project name"""
     wandb_entity: str = "sophia435256-robros"
     """the entity (team) of wandb's project"""
 
+class LoggingHelper:
+    def __init__(self, wandb_logger=None):
+        """
+        간단한 WandB 로깅 헬퍼.
+        prefix가 주어지면 'prefix/key' 형태로, 아니면 key 그대로 로그.
+        """
+        self.wandb_logger = wandb_logger
+
+    def log(self, data: dict, prefix: Optional[str], step: int):
+        if self.wandb_logger is None:
+            return  # wandb 안 쓰는 경우
+        
+        if prefix is None or prefix == "":
+            log_dict = data
+        else:
+            log_dict = {f"{prefix}/{k}": v for k, v in data.items()}
+        
+        self.wandb_logger.log(log_dict, step=step)
+
+
 
 def make_env(env_id, seed, idx, capture_video, run_name):
     def thunk():
-        # if capture_video and idx == 0:
-        #     env = gym.make(env_id, render_mode="rgb_array")
-        #     env = gym.wrappers.RecordVideo(env, f"videos/{run_name}")
-        # else:
-        #     env = gym.make(env_id)
-        # env = gym.wrappers.RecordEpisodeStatistics(env)
-        # env.action_space.seed(seed)
         env, eval_env, train_dataset, val_dataset = make_env_and_datasets(env_id)
         return env
-
     return thunk
+
 
 class BatchRenorm(nn.Module):
     """BatchRenorm Module, implemented based on the Batch Renormalization paper (https://arxiv.org/abs/1702.03275).
@@ -498,8 +515,12 @@ class TrainState(FlaxTrainState):
 if __name__ == "__main__":
     args = tyro.cli(Args)
     run_name = f"{args.env_id}__{args.exp_name}__{args.seed}__steps{args.denoising_steps}__{int(time.time())}"
+    
+    logger = LoggingHelper(wandb_logger=True if args.track else None)
+
     if args.track:
         import wandb
+        print("[DEBUG] wandb.init start")
 
         wandb.init(
             project=args.wandb_project_name,
@@ -507,8 +528,17 @@ if __name__ == "__main__":
             sync_tensorboard=False,
             config=vars(args),
             name=run_name,
-            group="crossq_transformer"
+            group="crossq_transformer",
         )
+        print("[DEBUG] wandb.init done")
+        print("[DEBUG] wandb run url:", wandb.run.url)
+
+        # wandb 핸들을 logger에 등록
+        logger = LoggingHelper(wandb_logger=wandb)
+
+        # 디버그용 간단한 로그
+        logger.log({"after_init": 1.0}, prefix="debug", step=0)
+
     writer = SummaryWriter(f"runs/{run_name}")
     writer.add_text(
         "hyperparameters",
@@ -522,7 +552,11 @@ if __name__ == "__main__":
     key, actor_key, qf_key, alpha_key = jax.random.split(key, 4)
 
     # Environment setup
-    envs = gym.vector.SyncVectorEnv([make_env(args.env_id, args.seed, 0, args.capture_video, run_name)])
+    envs = gym.vector.SyncVectorEnv(
+        [make_env(args.env_id, args.seed, 0, args.capture_video, run_name)]
+    )
+    eval_env, _, _, _ = make_env_and_datasets(args.env_id)
+
     assert isinstance(envs.single_action_space, gym.spaces.Box), "only continuous action space is supported"
 
     envs.single_observation_space.dtype = np.float32
@@ -665,6 +699,50 @@ if __name__ == "__main__":
             )
         else:
             return qf.apply(params, obs, action, training=False)
+        
+    @jax.jit
+    def actor_apply_deterministic(params, batch_stats, obs, key):
+        return actor_apply_inference(params, batch_stats, obs, key)
+
+    def evaluate_policy(eval_env, actor_state: TrainState, key: jnp.ndarray, n_episodes: int):
+        returns = []
+        lengths = []
+
+        for _ in tqdm.tqdm(range(n_episodes)):
+            obs, _ = eval_env.reset()
+            done = False
+            trunc = False
+            ep_return = 0.0
+            ep_len = 0
+
+            while not (done or trunc):
+                obs_jnp = jnp.array(obs[None, ...], dtype=jnp.float32)
+                key, sample_key = jax.random.split(key)
+                actions, _ = actor_apply_deterministic(
+                    actor_state.params,
+                    actor_state.batch_stats,
+                    obs_jnp,
+                    sample_key,
+                )
+                action = np.array(jax.device_get(actions[0]))
+
+                next_obs, reward, done, trunc, info = eval_env.step(action)
+                if is_robomimic_env(args.env_id):
+                    reward = reward - 1.0
+                if args.sparse:
+                    reward = (reward != 0.0) * -1.0
+
+                ep_return += float(reward)
+                ep_len += 1
+                obs = next_obs
+
+            returns.append(ep_return)
+            lengths.append(ep_len)
+
+        returns = np.array(returns, dtype=np.float32)
+        lengths = np.array(lengths, dtype=np.float32)
+        return returns.mean(), returns.std(), lengths.mean(), key
+
 
     @jax.jit
     def update_critic(
@@ -880,39 +958,63 @@ if __name__ == "__main__":
             if global_step % args.log_freq == 0:
                 sps = int(global_step / (time.time() - start_time))
                 log_data = {
-                    "losses/qf_loss": qf_loss_value.item(),
-                    "losses/qf_values": qf_a_values.item(),
-                    "losses/next_q_values": next_q_values.item(),
-                    "losses/actor_loss": actor_loss_value.item() if isinstance(actor_loss_value, jnp.ndarray) else actor_loss_value,
-                    "charts/n_updates": n_updates,
-                    "charts/SPS": sps
+                    "qf_loss": qf_loss_value.item(),
+                    "qf_values": qf_a_values.item(),
+                    "next_q_values": next_q_values.item(),
+                    "actor_loss": actor_loss_value.item() if isinstance(actor_loss_value, jnp.ndarray) else actor_loss_value,
+                    "n_updates": n_updates,
+                    "SPS": sps,
                 }
 
                 alpha_value = args.alpha
                 if args.autotune and alpha_state is not None:
                     current_alpha = entropy_coef.apply({'params': alpha_state.params})
                     alpha_value = current_alpha.item()
-                    log_data["losses/alpha_loss"] = alpha_loss_value.item() if isinstance(alpha_loss_value, jnp.ndarray) else alpha_loss_value
+                    log_data["alpha_loss"] = alpha_loss_value.item() if isinstance(alpha_loss_value, jnp.ndarray) else alpha_loss_value
                 
-                log_data["losses/alpha"] = alpha_value
+                log_data["alpha"] = alpha_value
 
-                for k, v in log_data.items():
-                    writer.add_scalar(k, v, global_step)
-                
+                # TensorBoard
+                writer.add_scalar("losses/qf_loss", log_data["qf_loss"], global_step)
+                writer.add_scalar("losses/qf_values", log_data["qf_values"], global_step)
+                writer.add_scalar("losses/next_q_values", log_data["next_q_values"], global_step)
+                writer.add_scalar("losses/actor_loss", log_data["actor_loss"], global_step)
+                writer.add_scalar("losses/alpha", log_data["alpha"], global_step)
+                if "alpha_loss" in log_data:
+                    writer.add_scalar("losses/alpha_loss", log_data["alpha_loss"], global_step)
+                writer.add_scalar("charts/n_updates", log_data["n_updates"], global_step)
+                writer.add_scalar("charts/SPS", log_data["SPS"], global_step)
+
                 print(f"SPS: {sps}")
 
-                if args.track:
-                    for k, v in log_data.items():
-                        log_buffer.setdefault(k, deque(maxlen=20)).append(v)
-                    
-                    avg_logs = {k: np.mean(v) for k, v in log_buffer.items() if "charts/episodic" not in k}
-                    if "charts/episodic_return" in log_buffer:
-                        avg_logs["charts/episodic_return"] = np.mean(log_buffer["charts/episodic_return"])
-                    if "charts/episodic_length" in log_buffer:
-                         avg_logs["charts/episodic_length"] = np.mean(log_buffer["charts/episodic_length"])
-                    
-                    wandb.log(avg_logs, step=global_step)
-    
+                # WandB: prefix='train'
+                logger.log(log_data, prefix="train", step=int(global_step))
+
+        if args.track and (global_step % args.eval_freq == 0): 
+            print(f"[DEBUG] Eval triggered at step {global_step}")   
+            eval_mean, eval_std, eval_len, key = evaluate_policy(
+                eval_env,
+                actor_state,
+                key,
+                n_episodes=args.eval_episodes,
+            )
+            print(f"[DEBUG] Eval result: mean={eval_mean}, std={eval_std}, len={eval_len}") 
+
+            # TensorBoard
+            writer.add_scalar("eval/return_mean", eval_mean, global_step)
+            writer.add_scalar("eval/return_std", eval_std, global_step)
+            writer.add_scalar("eval/episode_length", eval_len, global_step)
+
+            # WandB
+            eval_log = {
+                "return_mean": float(eval_mean),
+                "return_std": float(eval_std),
+                "episode_length": float(eval_len),
+            }
+            print(f"[DEBUG] logger.log(eval) at step {global_step}")
+            logger.log(eval_log, prefix="eval", step=int(global_step))
+
+
     envs.close()
     writer.close()
     if args.track:
